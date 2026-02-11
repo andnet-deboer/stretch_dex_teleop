@@ -1,0 +1,36 @@
+# UMI Cube Faces (64mm tags on 86mm cube)
+"5":
+  name: "umi_top"
+  length_mm: 64.0
+  use_rgb_only: False
+  frames:
+    "umi_cube":
+      trans: [0.0, 0.0, -0.043] # Move 43mm from tag into cube center
+"1":
+  name: "umi_front"
+  length_mm: 64.0
+  use_rgb_only: False
+  frames:
+    "umi_cube":
+      trans: [0.0, 0.043, 0.0]
+"2":
+  name: "umi_bottom"
+  length_mm: 64.0
+  use_rgb_only: False
+  frames:
+    "umi_cube":
+      trans: [0.0, 0.0, 0.043]
+"3":
+  name: "umi_back"
+  length_mm: 64.0
+  use_rgb_only: False
+  frames:
+    "umi_cube":
+      trans: [0.0, -0.043, 0.0]
+"4":
+  name: "umi_left"
+  length_mm: 64.0
+  use_rgb_only: False
+  frames:
+    "umi_cube":
+      trans: [0.043, 0.0, 0.0]
