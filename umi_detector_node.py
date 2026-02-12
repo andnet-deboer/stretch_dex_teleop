@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-UMI Cube Tracker - Multi-Tag Fusion with Face-Specific Rotations
-Properly handles that each cube face has a different orientation!
+UMI Cube Tracker - DEBUG VERSION with extensive logging
 """
 
 import cv2
@@ -17,81 +16,41 @@ from geometry_msgs.msg import TransformStamped
 from scipy.spatial.transform import Rotation as R_scipy, Slerp
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# CUBE FACE ORIENTATIONS (relative to cube center)
-# ══════════════════════════════════════════════════════════════════════════════
-
-# Based on your bundle YAML:
-# Tag 5 (top):    +Z face, no rotation (qw=1.0)
-# Tag 1 (front):  -Y face, 90° around X (qx=0.7071, qw=0.7071)
-# Tag 2 (bottom): -Z face, 180° around X (qx=1.0, qw=0.0)
-# Tag 3 (back):   +Y face, -90° around X (qx=-0.7071, qw=0.7071)
-# Tag 4 (left):   -X face, -90° around Y (qy=-0.7071, qw=0.7071)
-
+# Face rotations (from bundle YAML)
 TAG_TO_CUBE_ROTATIONS = {
-    5: [0.0, 0.0, 0.0, 1.0],           # Top: identity
-    1: [0.7071, 0.0, 0.0, 0.7071],     # Front: 90° X
-    2: [1.0, 0.0, 0.0, 0.0],           # Bottom: 180° X
-    3: [-0.7071, 0.0, 0.0, 0.7071],    # Back: -90° X
-    4: [0.0, -0.7071, 0.0, 0.7071],    # Left: -90° Y
+    5: [0.0, 0.0, 0.0, 1.0],           # Top
+    1: [0.7071, 0.0, 0.0, 0.7071],     # Front
+    2: [1.0, 0.0, 0.0, 0.0],           # Bottom
+    3: [-0.7071, 0.0, 0.0, 0.7071],    # Back
+    4: [0.0, -0.7071, 0.0, 0.7071],    # Left
 }
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# COORDINATE UTILITIES
-# ══════════════════════════════════════════════════════════════════════════════
-
 def axes_to_quaternion(x, y, z):
-    """Convert three orthonormal axes to quaternion."""
     mat = np.column_stack((x, y, z))
     return R_scipy.from_matrix(mat).as_quat()
 
 
 def get_cube_pose_from_tag(tag_id, tag_pos, tag_x, tag_y, tag_z, trans_offset):
-    """
-    Calculate cube center pose from a single tag detection.
-    
-    Args:
-        tag_id: AprilTag ID (determines face orientation)
-        tag_pos: Tag position [x, y, z]
-        tag_x, tag_y, tag_z: Tag axes
-        trans_offset: Translation from YAML [dx, dy, dz] in tag frame
-    
-    Returns:
-        {'pos': [x,y,z], 'x_axis': [...], 'y_axis': [...], 'z_axis': [...]}
-    """
-    # Step 1: Calculate cube center position
+    """Calculate cube pose from tag WITH rotation correction."""
+    # Position
     cube_pos = tag_pos + (trans_offset[0] * tag_x) + (trans_offset[1] * tag_y) + (trans_offset[2] * tag_z)
     
-    # Step 2: Transform tag orientation to cube orientation
-    # Tag rotation in world frame
+    # Rotation
     R_tag_in_world = np.column_stack((tag_x, tag_y, tag_z))
-    
-    # Rotation from tag frame to cube frame (face-specific)
     quat_tag_to_cube = TAG_TO_CUBE_ROTATIONS.get(tag_id, [0, 0, 0, 1])
     R_tag_to_cube = R_scipy.from_quat(quat_tag_to_cube).as_matrix()
-    
-    # Cube orientation in world = Tag_in_world * Tag_to_cube
     R_cube_in_world = R_tag_in_world @ R_tag_to_cube
-    
-    cube_x = R_cube_in_world[:, 0]
-    cube_y = R_cube_in_world[:, 1]
-    cube_z = R_cube_in_world[:, 2]
     
     return {
         'pos': cube_pos,
-        'x_axis': cube_x,
-        'y_axis': cube_y,
-        'z_axis': cube_z
+        'x_axis': R_cube_in_world[:, 0],
+        'y_axis': R_cube_in_world[:, 1],
+        'z_axis': R_cube_in_world[:, 2]
     }
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# FUSION ALGORITHMS
-# ══════════════════════════════════════════════════════════════════════════════
-
 def calculate_tag_weight(corners):
-    """Weight by area in image plane."""
     pts = corners.reshape(4, 2)
     area = cv2.contourArea(pts)
     weight = np.clip(area / 1000.0, 0.1, 1.0)
@@ -99,25 +58,42 @@ def calculate_tag_weight(corners):
 
 
 def average_quaternions(quaternions, weights):
-    """Weighted quaternion average (Markley method)."""
+    """Weighted quaternion average with sign correction."""
+    if len(quaternions) == 0:
+        return np.array([0, 0, 0, 1])
+    
+    # Normalize all quaternions
+    quaternions = [np.array(q) / np.linalg.norm(q) for q in quaternions]
+    
+    # Align to same hemisphere (fix double-cover)
+    q_ref = quaternions[0]
+    aligned_quats = [q_ref]
+    
+    print(f"  QUATERNION ALIGNMENT:")
+    for i, q in enumerate(quaternions[1:], 1):
+        dot = np.dot(q_ref, q)
+        if dot < 0:
+            print(f"    Quat {i}: dot={dot:.4f} → FLIPPING SIGN")
+            aligned_quats.append(-q)
+        else:
+            print(f"    Quat {i}: dot={dot:.4f} → OK")
+            aligned_quats.append(q)
+    
+    # Markley averaging
     Q = np.zeros((4, 4))
-    for q, w in zip(quaternions, weights):
-        q = np.array(q) / np.linalg.norm(q)
+    for q, w in zip(aligned_quats, weights):
         Q += w * np.outer(q, q)
+    
     eigenvalues, eigenvectors = np.linalg.eigh(Q)
+    print(f"  Eigenvalues: {eigenvalues}")
     return eigenvectors[:, -1]
 
 
 def slerp(q0, q1, t):
-    """Spherical linear interpolation."""
     rotations = R_scipy.from_quat([q0, q1])
     slerp_obj = Slerp([0, 1], rotations)
     return slerp_obj([t]).as_quat()[0]
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# APRILTAG MARKER CLASS
-# ══════════════════════════════════════════════════════════════════════════════
 
 class AprilTagMarker:
     def __init__(self, tag_id, marker_info):
@@ -138,13 +114,8 @@ class AprilTagMarker:
         _, rvec, tvec = cv2.solvePnP(points_3D, corners, camera_matrix, dist_coeffs)
         self.pos = tvec.flatten() / 1000.0
         R_mat = cv2.Rodrigues(rvec)[0]
-        # Coordinate swizzle
         self.axes = [-R_mat[:3, 1], -R_mat[:3, 0], -R_mat[:3, 2]]
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ROS 2 NODE
-# ══════════════════════════════════════════════════════════════════════════════
 
 class UmiDetectorNode(Node):
     def __init__(self):
@@ -153,7 +124,6 @@ class UmiDetectorNode(Node):
         self.bridge = CvBridge()
         self.tf_broadcaster = TransformBroadcaster(self)
         
-        # Load YAML
         try:
             with open('teleop_april_marker_info_86mm.yaml', 'r') as f:
                 self.marker_info = yaml.safe_load(f)
@@ -161,7 +131,7 @@ class UmiDetectorNode(Node):
             self.get_logger().error("YAML not found")
             self.marker_info = {}
         
-        # Robust detector config
+        # Detector config
         self.dictionary = aruco.getPredefinedDictionary(aruco.DICT_APRILTAG_36h11)
         params = aruco.DetectorParameters()
         params.adaptiveThreshWinSizeMin = 3
@@ -176,13 +146,13 @@ class UmiDetectorNode(Node):
         params.polygonalApproxAccuracyRate = 0.03
         self.detector = aruco.ArucoDetector(self.dictionary, params)
         
-        # State
         self.collection = {}
         self.camera_info_dict = None
         self.prev_cube_pose = None
-        self.smoothing_alpha = 0.3
+        self.smoothing_alpha = 0.7
+        self.enable_smoothing = True
+        self.frame_count = 0
         
-        # Subscriptions
         self.create_subscription(CameraInfo, '/camera/camera/color/camera_info', self.info_cb, 10)
         self.create_subscription(Image, '/camera/camera/color/image_raw', self.image_cb, 10)
     
@@ -196,6 +166,8 @@ class UmiDetectorNode(Node):
         if self.camera_info_dict is None:
             return
         
+        self.frame_count += 1
+        
         cv_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
         gray = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -205,7 +177,10 @@ class UmiDetectorNode(Node):
         if ids is None:
             return
         
-        # Detect all tags and get cube pose candidates
+        print(f"\n{'#'*100}")
+        print(f"FRAME {self.frame_count}: Detected {len(ids)} tags: {ids.flatten().tolist()}")
+        print(f"{'#'*100}")
+        
         cube_candidates = []
         
         for c, aid in zip(corners, ids.flatten()):
@@ -218,23 +193,20 @@ class UmiDetectorNode(Node):
             marker.update(c[0], self.camera_info_dict['camera_matrix'], 
                          self.camera_info_dict['distortion_coefficients'])
             
-            # Broadcast individual tag for debugging
             self.broadcast_frame(f"tag_{aid}", marker.pos, marker.axes[0], marker.axes[1], marker.axes[2])
             
-            # Get translation offset from YAML
+            # Get cube pose from this tag
             frames = marker.info.get('frames', {})
             if 'umi_cube' in frames:
                 trans = frames['umi_cube']['trans']
                 
-                # Calculate cube pose from this tag (WITH ROTATION)
                 cube_pose = get_cube_pose_from_tag(
-                    aid,
-                    marker.pos,
-                    marker.axes[0],
-                    marker.axes[1],
-                    marker.axes[2],
-                    trans
+                    aid, marker.pos, marker.axes[0], marker.axes[1], marker.axes[2], trans
                 )
+                
+                print(f"\nTag {aid} → Cube estimate:")
+                print(f"  Tag pos: [{marker.pos[0]:.4f}, {marker.pos[1]:.4f}, {marker.pos[2]:.4f}]")
+                print(f"  Cube pos: [{cube_pose['pos'][0]:.4f}, {cube_pose['pos'][1]:.4f}, {cube_pose['pos'][2]:.4f}]")
                 
                 cube_candidates.append({
                     'pos': cube_pose['pos'],
@@ -245,51 +217,93 @@ class UmiDetectorNode(Node):
                     'tag_id': aid
                 })
         
-        # Fuse multiple cube estimates
         if cube_candidates:
             fused_cube = self._fuse_cube_centers(cube_candidates)
             
             if fused_cube is not None:
-                smoothed_cube = self._smooth_pose_temporal(fused_cube)
+                if self.enable_smoothing:
+                    smoothed_cube = self._smooth_pose_temporal(fused_cube)
+                else:
+                    smoothed_cube = fused_cube
+                    
                 self.broadcast_frame_quat('umi_cube', smoothed_cube['pos'], smoothed_cube['quat'])
     
     def _fuse_cube_centers(self, candidates):
-        if len(candidates) == 0:
-            return None
+        print(f"\n{'='*90}")
+        print(f"FUSION: {len(candidates)} candidates")
+        print(f"{'='*90}")
         
         if len(candidates) == 1:
             c = candidates[0]
             quat = axes_to_quaternion(c['x_axis'], c['y_axis'], c['z_axis'])
+            print(f"SINGLE TAG {c['tag_id']} - No fusion needed")
+            print(f"  Quat: [{quat[0]:.4f}, {quat[1]:.4f}, {quat[2]:.4f}, {quat[3]:.4f}]")
             return {'pos': c['pos'], 'quat': quat}
         
-        # Weighted fusion
+        # Multiple tags
         weights = []
         positions = []
         quaternions = []
         
+        print(f"\nRAW TAG DATA:")
         for c in candidates:
             w = calculate_tag_weight(c['corners'])
             weights.append(w)
             positions.append(c['pos'])
             quat = axes_to_quaternion(c['x_axis'], c['y_axis'], c['z_axis'])
             quaternions.append(quat)
+            
+            euler = R_scipy.from_quat(quat).as_euler('xyz', degrees=True)
+            print(f"  Tag {c['tag_id']}:")
+            print(f"    Weight: {w:.4f}")
+            print(f"    Position: [{c['pos'][0]:.4f}, {c['pos'][1]:.4f}, {c['pos'][2]:.4f}]")
+            print(f"    Quaternion: [{quat[0]:.4f}, {quat[1]:.4f}, {quat[2]:.4f}, {quat[3]:.4f}]")
+            print(f"    Euler (XYZ°): [{euler[0]:.2f}, {euler[1]:.2f}, {euler[2]:.2f}]")
         
+        # Normalize weights
         weights = np.array(weights)
+        print(f"\nWeights (raw): {weights}")
         weights /= weights.sum()
+        print(f"Weights (normalized): {weights}")
         
+        # Fuse position
         fused_pos = np.average(positions, axis=0, weights=weights)
+        print(f"\nFUSED POSITION: [{fused_pos[0]:.4f}, {fused_pos[1]:.4f}, {fused_pos[2]:.4f}]")
+        
+        # Check quaternion dot products
+        print(f"\nQUATERNION DOT PRODUCTS:")
+        for i in range(len(quaternions)):
+            for j in range(i+1, len(quaternions)):
+                dot = np.dot(quaternions[i], quaternions[j])
+                status = "❌ OPPOSITE" if dot < 0 else "✓ SAME"
+                print(f"  Tag {candidates[i]['tag_id']} · Tag {candidates[j]['tag_id']}: {dot:.4f} {status}")
+        
+        # Fuse rotation
         fused_quat = average_quaternions(quaternions, weights)
+        euler_fused = R_scipy.from_quat(fused_quat).as_euler('xyz', degrees=True)
+        
+        print(f"\nFUSED QUATERNION: [{fused_quat[0]:.4f}, {fused_quat[1]:.4f}, {fused_quat[2]:.4f}, {fused_quat[3]:.4f}]")
+        print(f"FUSED EULER (XYZ°): [{euler_fused[0]:.2f}, {euler_fused[1]:.2f}, {euler_fused[2]:.2f}]")
+        print(f"{'='*90}\n")
         
         return {'pos': fused_pos, 'quat': fused_quat}
     
     def _smooth_pose_temporal(self, current_pose):
         if self.prev_cube_pose is None:
             self.prev_cube_pose = current_pose
+            print(f"SMOOTHING: First frame - no smoothing applied")
             return current_pose
         
         alpha = self.smoothing_alpha
+        
+        print(f"\nSMOOTHING (alpha={alpha}):")
+        print(f"  Previous quat: {self.prev_cube_pose['quat']}")
+        print(f"  Current quat:  {current_pose['quat']}")
+        
         smoothed_pos = alpha * current_pose['pos'] + (1 - alpha) * self.prev_cube_pose['pos']
         smoothed_quat = slerp(self.prev_cube_pose['quat'], current_pose['quat'], alpha)
+        
+        print(f"  Smoothed quat: {smoothed_quat}")
         
         smoothed_pose = {'pos': smoothed_pos, 'quat': smoothed_quat}
         self.prev_cube_pose = smoothed_pose
