@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-UMI Cube Tracker - DYNAMIC YAML VERSION with ROS Params
+UMI Cube Tracker - BASE_LINK ALIGNED VERSION
 """
 
 import cv2
@@ -12,10 +12,9 @@ from rclpy.node import Node
 from rcl_interfaces.msg import SetParametersResult
 from sensor_msgs.msg import Image, CameraInfo
 from cv_bridge import CvBridge
-from tf2_ros import TransformBroadcaster
-from geometry_msgs.msg import TransformStamped
+from tf2_ros import TransformBroadcaster, TransformListener, Buffer
+from geometry_msgs.msg import TransformStamped, PoseStamped
 from scipy.spatial.transform import Rotation as R_scipy
-import time
 
 class OneEuroFilter:
     def __init__(self, freq, min_cutoff=1.0, beta=0.0, d_cutoff=1.0):
@@ -48,10 +47,6 @@ class OneEuroFilter:
         self.x_prev = x_filtered
         self.dx_prev = edx
         return x_filtered
-
-def axes_to_quaternion(x, y, z):
-    mat = np.column_stack((x, y, z))
-    return R_scipy.from_matrix(mat).as_quat()
 
 def get_cube_pose_from_tag(tag_pos, tag_x, tag_y, tag_z, trans_offset, quat_tag_to_cube):
     cube_pos = tag_pos + (trans_offset[0] * tag_x) + (trans_offset[1] * tag_y) + (trans_offset[2] * tag_z)
@@ -99,8 +94,12 @@ class UmiDetectorNode(Node):
         super().__init__('umi_detector_node')
         self.bridge = CvBridge()
         self.tf_broadcaster = TransformBroadcaster(self)
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+        
+        self.pose_pub = self.create_publisher(PoseStamped, 'umi_cube_pose', 10)
+        self.gripper_pub = self.create_publisher(PoseStamped, 'umi_gripper_pose', 10)
 
-        # Declare params
         self.declare_parameter('pos_min_cutoff', 0.9)
         self.declare_parameter('pos_beta', 0.06)
         self.declare_parameter('quat_min_cutoff', 0.1)
@@ -155,29 +154,69 @@ class UmiDetectorNode(Node):
                 res = get_cube_pose_from_tag(marker.pos, marker.axes[0], marker.axes[1], marker.axes[2], 
                                             config.get('trans', [0.0,0.0,0.0]), config.get('quat', [0.0,0.0,0.0,1.0]))
                 cube_candidates.append({'pos': res['pos'], 'quat': res['quat'], 'weight': calculate_tag_weight(c[0])})
-
         if cube_candidates:
+            # 1. Detection relative to Camera (solvePnP output)
             weights = np.array([c['weight'] for c in cube_candidates])
-            fused_pos = np.average([c['pos'] for c in cube_candidates], axis=0, weights=weights/sum(weights))
-            fused_quat = average_quaternions([c['quat'] for c in cube_candidates], weights/sum(weights))
-            
-            # Apply dynamic rotation offsets
-            r_off = R_scipy.from_euler('xyz', [self.get_parameter('off_r').value, 
-                                               self.get_parameter('off_p').value, 
-                                               self.get_parameter('off_y').value], degrees=True)
-            fused_quat = (R_scipy.from_quat(fused_quat) * r_off).as_quat()
+            f_pos_cam = np.average([c['pos'] for c in cube_candidates], axis=0, weights=weights/sum(weights))
+            f_quat_cam = average_quaternions([c['quat'] for c in cube_candidates], weights/sum(weights))
 
+            try:
+                # 1. Lookup the transform from base to camera
+                t = self.tf_buffer.lookup_transform('base_link', 'camera_color_optical_frame', rclpy.time.Time())
+                R_base_cam = R_scipy.from_quat([t.transform.rotation.x, t.transform.rotation.y, t.transform.rotation.z, t.transform.rotation.w])
+                T_base_cam = np.array([t.transform.translation.x, t.transform.translation.y, t.transform.translation.z])
+                
+                # 2. Project Position into Base Frame
+                fused_pos = T_base_cam + R_base_cam.apply(f_pos_cam)
+                
+                # 3. Project Orientation into Base Frame
+                R_cam_cube = R_scipy.from_quat(f_quat_cam)
+                R_cube_world = R_base_cam * R_cam_cube 
+
+                # 4. THE AXIS SWIZZLE (Addressing your 1, 2, and 3)
+                # We rotate the world-projected cube so Z points UP and X points FORWARD
+                # This specific Euler sequence corrects the flips you described:
+                R_fix = R_scipy.from_euler('zyx', [0, -45, 180], degrees=True)
+                
+                # Apply the fix to the projected orientation
+                fused_quat = (R_cube_world * R_fix).as_quat()
+
+            except Exception as e:
+                self.get_logger().warn(f"TF Transform failed: {e}")
+                return
+            
+            # 4. Filtering (Keeps the frame smooth)
             fused_pos = self.pos_filter.filter(fused_pos)
-            if self.prev_cube_pose is not None and np.dot(fused_quat, self.prev_cube_pose['quat']) < 0: fused_quat = -fused_quat
+            if self.prev_cube_pose is not None and np.dot(fused_quat, self.prev_cube_pose['quat']) < 0:
+                fused_quat = -fused_quat
             fq_raw = self.quat_filter.filter(fused_quat)
             fused_quat = fq_raw / np.linalg.norm(fq_raw)
-
             self.prev_cube_pose = {'pos': fused_pos, 'quat': fused_quat}
-            self.broadcast_frame_quat('umi_cube', fused_pos, fused_quat)
 
-    def broadcast_frame_quat(self, name, pos, quat):
+            # 5. Broadcast & Publish (Parent: base_link)
+            # Now 'umi_cube' axes will look flat in RViz relative to the grid
+            self.broadcast_frame_quat('umi_cube', fused_pos, fused_quat, 'base_link')
+            
+            p_msg = PoseStamped()
+            p_msg.header.stamp, p_msg.header.frame_id = self.get_clock().now().to_msg(), 'base_link'
+            p_msg.pose.position.x, p_msg.pose.position.y, p_msg.pose.position.z = map(float, fused_pos)
+            p_msg.pose.orientation.x, p_msg.pose.orientation.y, p_msg.pose.orientation.z, p_msg.pose.orientation.w = map(float, fused_quat)
+            self.pose_pub.publish(p_msg)
+
+            # 6. Project Gripper (X-axis offset)
+            R_base_cube = R_scipy.from_quat(fused_quat)
+            grasp_pos = fused_pos + R_base_cube.apply(np.array([0.242, 0.0, 0.0]))
+            self.broadcast_frame_quat('umi_gripper', grasp_pos, fused_quat, 'base_link')
+            
+            g_msg = PoseStamped()
+            g_msg.header = p_msg.header
+            g_msg.pose.position.x, g_msg.pose.position.y, g_msg.pose.position.z = map(float, grasp_pos)
+            g_msg.pose.orientation.x, g_msg.pose.orientation.y, g_msg.pose.orientation.z, g_msg.pose.orientation.w = map(float, fused_quat)
+            self.gripper_pub.publish(g_msg)
+
+    def broadcast_frame_quat(self, name, pos, quat, parent):
         t = TransformStamped()
-        t.header.stamp, t.header.frame_id, t.child_frame_id = self.get_clock().now().to_msg(), 'camera_color_optical_frame', name
+        t.header.stamp, t.header.frame_id, t.child_frame_id = self.get_clock().now().to_msg(), parent, name
         t.transform.translation.x, t.transform.translation.y, t.transform.translation.z = map(float, pos)
         t.transform.rotation.x, t.transform.rotation.y, t.transform.rotation.z, t.transform.rotation.w = map(float, quat)
         self.tf_broadcaster.sendTransform(t)
