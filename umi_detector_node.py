@@ -22,10 +22,10 @@ def axes_to_quaternion(x, y, z):
 
 def get_cube_pose_from_tag(tag_pos, tag_x, tag_y, tag_z, trans_offset, quat_tag_to_cube):
     """Calculate cube pose using YAML-provided rotation and translation."""
-    # 1. Position Calculation
+    # Position Calculation
     cube_pos = tag_pos + (trans_offset[0] * tag_x) + (trans_offset[1] * tag_y) + (trans_offset[2] * tag_z)
     
-    # 2. Rotation Calculation
+    # Rotation Calculation
     R_tag_in_world = np.column_stack((tag_x, tag_y, tag_z))
     R_tag_to_cube = R_scipy.from_quat(quat_tag_to_cube).as_matrix()
     
@@ -139,6 +139,19 @@ class UmiDetectorNode(Node):
             # Combine current rotation with the offset
             current_r = R_scipy.from_quat(fused_quat)
             fused_quat = (current_r * r_90_cw_x).as_quat()
+
+            # Create a -90 degree rotation around X
+            r_180_cw_y = R_scipy.from_euler('z', 180, degrees=True)
+            # Combine current rotation with the offset
+            current_r = R_scipy.from_quat(fused_quat)
+            fused_quat = (current_r *  r_180_cw_y).as_quat()
+
+
+            # Create a -90 degree rotation around X
+            r_90_cw_z = R_scipy.from_euler('z', 180, degrees=True)
+            # Combine current rotation with the offset
+            current_r = R_scipy.from_quat(fused_quat)
+            fused_quat = (current_r *   r_90_cw_z).as_quat()
             # --------------------------------------------------
             # Simple Smoothing
             if self.prev_cube_pose is not None:
