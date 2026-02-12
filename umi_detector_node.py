@@ -15,6 +15,43 @@ from cv_bridge import CvBridge
 from tf2_ros import TransformBroadcaster
 from geometry_msgs.msg import TransformStamped
 from scipy.spatial.transform import Rotation as R_scipy, Slerp
+import time
+
+class OneEuroFilter:
+    def __init__(self, freq, min_cutoff=1.0, beta=0.0, d_cutoff=1.0):
+        self.freq = freq
+        self.min_cutoff = min_cutoff
+        self.beta = beta
+        self.d_cutoff = d_cutoff
+        self.x_prev = None
+        self.dx_prev = None
+
+    def _alpha(self, cutoff):
+        tau = 1.0 / (2 * np.pi * cutoff)
+        te = 1.0 / self.freq
+        return 1.0 / (1.0 + tau / te)
+
+    def filter(self, x):
+        if self.x_prev is None:
+            self.x_prev = x
+            self.dx_prev = np.zeros_like(x)
+            return x
+
+        # Calculate derivative
+        dx = (x - self.x_prev) * self.freq
+        edx = self.dx_prev + self._alpha(self.d_cutoff) * (dx - self.dx_prev)
+        
+        # Calculate cutoff based on velocity
+        cutoff = self.min_cutoff + self.beta * np.abs(edx)
+        alpha = self._alpha(cutoff)
+        
+        # Filter signal
+        x_filtered = self.x_prev + alpha * (x - self.x_prev)
+        
+        # Update state
+        self.x_prev = x_filtered
+        self.dx_prev = edx
+        return x_filtered
 
 def axes_to_quaternion(x, y, z):
     mat = np.column_stack((x, y, z))
@@ -79,6 +116,13 @@ class UmiDetectorNode(Node):
         super().__init__('umi_detector_node')
         self.bridge = CvBridge()
         self.tf_broadcaster = TransformBroadcaster(self)
+
+        # Initialize Filters
+        # freq: approx 30Hz 
+        # min_cutoff: Lower = smoother/slower. Start at 0.5 - 1.0
+        # beta: Higher = less lag during fast movement. Start at 0.01
+        self.pos_filter = OneEuroFilter(freq=30.0, min_cutoff=0.8, beta=0.02)
+        self.quat_filter = OneEuroFilter(freq=30.0, min_cutoff=0.5, beta=0.01)
         
         # Load YAML
         try:
@@ -152,14 +196,22 @@ class UmiDetectorNode(Node):
             # Combine current rotation with the offset
             current_r = R_scipy.from_quat(fused_quat)
             fused_quat = (current_r *   r_90_cw_z).as_quat()
-            # --------------------------------------------------
-            # Simple Smoothing
+
+            # ONE EURO FILTER
+            # Filter Position
+            fused_pos = self.pos_filter.filter(fused_pos)
+
+            # Filter Rotation (Quaternion)
             if self.prev_cube_pose is not None:
-                fused_pos = 0.7 * fused_pos + 0.3 * self.prev_cube_pose['pos']
-                # Slerp for rotation
-                rots = R_scipy.from_quat([self.prev_cube_pose['quat'], fused_quat])
-                fused_quat = Slerp([0, 1], rots)([0.7]).as_quat()[0]
+                # Flip sign if quaternions are in opposite hemispheres to prevent 360-degree flips
+                if np.dot(fused_quat, self.prev_cube_pose['quat']) < 0:
+                    fused_quat = -fused_quat
             
+            # Filter the components and re-normalize to keep it a valid rotation
+            filtered_quat_raw = self.quat_filter.filter(fused_quat)
+            fused_quat = filtered_quat_raw / np.linalg.norm(filtered_quat_raw)
+
+            # Update state and broadcast
             self.prev_cube_pose = {'pos': fused_pos, 'quat': fused_quat}
             self.broadcast_frame_quat('umi_cube', fused_pos, fused_quat)
 
