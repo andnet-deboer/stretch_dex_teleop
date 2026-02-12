@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-UMI Cube Tracker - DYNAMIC YAML VERSION
-Reads both translation and rotation from the YAML file.
+UMI Cube Tracker - DYNAMIC YAML VERSION with ROS Params
 """
 
 import cv2
@@ -10,11 +9,12 @@ import cv2.aruco as aruco
 import yaml
 import rclpy
 from rclpy.node import Node
+from rcl_interfaces.msg import SetParametersResult
 from sensor_msgs.msg import Image, CameraInfo
 from cv_bridge import CvBridge
 from tf2_ros import TransformBroadcaster
 from geometry_msgs.msg import TransformStamped
-from scipy.spatial.transform import Rotation as R_scipy, Slerp
+from scipy.spatial.transform import Rotation as R_scipy
 import time
 
 class OneEuroFilter:
@@ -26,6 +26,10 @@ class OneEuroFilter:
         self.x_prev = None
         self.dx_prev = None
 
+    def update_params(self, min_cutoff=None, beta=None):
+        if min_cutoff is not None: self.min_cutoff = min_cutoff
+        if beta is not None: self.beta = beta
+
     def _alpha(self, cutoff):
         tau = 1.0 / (2 * np.pi * cutoff)
         te = 1.0 / self.freq
@@ -36,19 +40,11 @@ class OneEuroFilter:
             self.x_prev = x
             self.dx_prev = np.zeros_like(x)
             return x
-
-        # Calculate derivative
         dx = (x - self.x_prev) * self.freq
         edx = self.dx_prev + self._alpha(self.d_cutoff) * (dx - self.dx_prev)
-        
-        # Calculate cutoff based on velocity
         cutoff = self.min_cutoff + self.beta * np.abs(edx)
         alpha = self._alpha(cutoff)
-        
-        # Filter signal
         x_filtered = self.x_prev + alpha * (x - self.x_prev)
-        
-        # Update state
         self.x_prev = x_filtered
         self.dx_prev = edx
         return x_filtered
@@ -58,21 +54,11 @@ def axes_to_quaternion(x, y, z):
     return R_scipy.from_matrix(mat).as_quat()
 
 def get_cube_pose_from_tag(tag_pos, tag_x, tag_y, tag_z, trans_offset, quat_tag_to_cube):
-    """Calculate cube pose using YAML-provided rotation and translation."""
-    # Position Calculation
     cube_pos = tag_pos + (trans_offset[0] * tag_x) + (trans_offset[1] * tag_y) + (trans_offset[2] * tag_z)
-    
-    # Rotation Calculation
     R_tag_in_world = np.column_stack((tag_x, tag_y, tag_z))
     R_tag_to_cube = R_scipy.from_quat(quat_tag_to_cube).as_matrix()
-    
-    # Cube_in_world = Tag_in_world * INVERSE(Tag_to_cube)
     R_cube_in_world = R_tag_in_world @ R_tag_to_cube.T
-    
-    return {
-        'pos': cube_pos,
-        'quat': R_scipy.from_matrix(R_cube_in_world).as_quat()
-    }
+    return {'pos': cube_pos, 'quat': R_scipy.from_matrix(R_cube_in_world).as_quat()}
 
 def calculate_tag_weight(corners):
     pts = corners.reshape(4, 2)
@@ -87,7 +73,6 @@ def average_quaternions(quaternions, weights):
     for q in quaternions:
         dot = np.dot(q_ref, q)
         aligned_quats.append(q if dot >= 0 else -q)
-    
     Q = np.zeros((4, 4))
     for q, w in zip(aligned_quats, weights):
         Q += w * np.outer(q, q)
@@ -96,7 +81,6 @@ def average_quaternions(quaternions, weights):
 class AprilTagMarker:
     def __init__(self, tag_id, marker_info):
         self.tag_id = tag_id
-        # Look for specific ID in YAML, fallback to default
         self.info = marker_info.get(str(tag_id), {'length_mm': 64.0, 'frames': {}})
         self.length_mm = self.info.get('length_mm', 64.0)
         self.pos = None
@@ -108,7 +92,6 @@ class AprilTagMarker:
         _, rvec, tvec = cv2.solvePnP(points_3D, corners, camera_matrix, dist_coeffs)
         self.pos = tvec.flatten() / 1000.0
         R_mat = cv2.Rodrigues(rvec)[0]
-        # X, Y, Z axes for the tag
         self.axes = [-R_mat[:3, 1], -R_mat[:3, 0], -R_mat[:3, 2]]
 
 class UmiDetectorNode(Node):
@@ -117,30 +100,39 @@ class UmiDetectorNode(Node):
         self.bridge = CvBridge()
         self.tf_broadcaster = TransformBroadcaster(self)
 
-        # Initialize Filters
-        # freq: approx 30Hz 
-        # min_cutoff: Lower = smoother/slower. Start at 0.5 - 1.0
-        # beta: Higher = less lag during fast movement. Start at 0.01
-        self.pos_filter = OneEuroFilter(freq=30.0, min_cutoff=0.8, beta=0.02)
-        self.quat_filter = OneEuroFilter(freq=30.0, min_cutoff=0.5, beta=0.01)
+        # Declare params
+        self.declare_parameter('pos_min_cutoff', 0.9)
+        self.declare_parameter('pos_beta', 0.06)
+        self.declare_parameter('quat_min_cutoff', 0.1)
+        self.declare_parameter('quat_beta', 0.06)
+        self.declare_parameter('off_r', 180.0)
+        self.declare_parameter('off_p', 0.0)
+        self.declare_parameter('off_y', 0.0)
+
+        self.pos_filter = OneEuroFilter(30.0, self.get_parameter('pos_min_cutoff').value, self.get_parameter('pos_beta').value)
+        self.quat_filter = OneEuroFilter(30.0, self.get_parameter('quat_min_cutoff').value, self.get_parameter('quat_beta').value)
+        self.add_on_set_parameters_callback(self.param_cb)
         
-        # Load YAML
         try:
             with open('teleop_april_marker_info_86mm.yaml', 'r') as f:
                 self.marker_info = yaml.safe_load(f)
-        except Exception as e:
-            self.get_logger().error(f"Failed to load YAML: {e}")
+        except:
             self.marker_info = {}
 
         self.dictionary = aruco.getPredefinedDictionary(aruco.DICT_APRILTAG_36h11)
         self.detector = aruco.ArucoDetector(self.dictionary, aruco.DetectorParameters())
-        
-        self.collection = {}
-        self.camera_info_dict = None
-        self.prev_cube_pose = None
+        self.collection, self.camera_info_dict, self.prev_cube_pose = {}, None, None
         
         self.create_subscription(CameraInfo, '/camera/camera/color/camera_info', self.info_cb, 10)
         self.create_subscription(Image, '/camera/camera/color/image_raw', self.image_cb, 10)
+
+    def param_cb(self, params):
+        for p in params:
+            if p.name == 'pos_min_cutoff': self.pos_filter.update_params(min_cutoff=p.value)
+            if p.name == 'pos_beta': self.pos_filter.update_params(beta=p.value)
+            if p.name == 'quat_min_cutoff': self.quat_filter.update_params(min_cutoff=p.value)
+            if p.name == 'quat_beta': self.quat_filter.update_params(beta=p.value)
+        return SetParametersResult(successful=True)
 
     def info_cb(self, msg):
         self.camera_info_dict = {'camera_matrix': np.array(msg.k).reshape((3, 3)), 'distortion_coefficients': np.array(msg.d)}
@@ -149,77 +141,43 @@ class UmiDetectorNode(Node):
         if self.camera_info_dict is None: return
         cv_img = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
         corners, ids, _ = self.detector.detectMarkers(cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY))
-        
         if ids is None: return
         
         cube_candidates = []
         for c, aid in zip(corners, ids.flatten()):
             aid = int(aid)
-            if aid not in self.collection:
-                self.collection[aid] = AprilTagMarker(aid, self.marker_info)
-            
+            if aid not in self.collection: self.collection[aid] = AprilTagMarker(aid, self.marker_info)
             marker = self.collection[aid]
             marker.update(c[0], self.camera_info_dict['camera_matrix'], self.camera_info_dict['distortion_coefficients'])
-            
-            # Use YAML for center and rotation
             frames = marker.info.get('frames', {})
             if 'umi_cube' in frames:
                 config = frames['umi_cube']
-                trans = config.get('trans', [0.0, 0.0, 0.0])
-                quat = config.get('quat', [0.0, 0.0, 0.0, 1.0])
-                
-                res = get_cube_pose_from_tag(marker.pos, marker.axes[0], marker.axes[1], marker.axes[2], trans, quat)
+                res = get_cube_pose_from_tag(marker.pos, marker.axes[0], marker.axes[1], marker.axes[2], 
+                                            config.get('trans', [0.0,0.0,0.0]), config.get('quat', [0.0,0.0,0.0,1.0]))
                 cube_candidates.append({'pos': res['pos'], 'quat': res['quat'], 'weight': calculate_tag_weight(c[0])})
 
         if cube_candidates:
-            weights = [c['weight'] for c in cube_candidates]
-            norm_weights = np.array(weights) / sum(weights)
+            weights = np.array([c['weight'] for c in cube_candidates])
+            fused_pos = np.average([c['pos'] for c in cube_candidates], axis=0, weights=weights/sum(weights))
+            fused_quat = average_quaternions([c['quat'] for c in cube_candidates], weights/sum(weights))
             
-            fused_pos = np.average([c['pos'] for c in cube_candidates], axis=0, weights=norm_weights)
-            fused_quat = average_quaternions([c['quat'] for c in cube_candidates], norm_weights)
-            
-            # Create a -90 degree rotation around X
-            r_90_cw_x = R_scipy.from_euler('x', 180, degrees=True)
-            # Combine current rotation with the offset
-            current_r = R_scipy.from_quat(fused_quat)
-            fused_quat = (current_r * r_90_cw_x).as_quat()
+            # Apply dynamic rotation offsets
+            r_off = R_scipy.from_euler('xyz', [self.get_parameter('off_r').value, 
+                                               self.get_parameter('off_p').value, 
+                                               self.get_parameter('off_y').value], degrees=True)
+            fused_quat = (R_scipy.from_quat(fused_quat) * r_off).as_quat()
 
-            # Create a -90 degree rotation around X
-            r_180_cw_y = R_scipy.from_euler('z', 180, degrees=True)
-            # Combine current rotation with the offset
-            current_r = R_scipy.from_quat(fused_quat)
-            fused_quat = (current_r *  r_180_cw_y).as_quat()
-
-
-            # Create a -90 degree rotation around X
-            r_90_cw_z = R_scipy.from_euler('z', 180, degrees=True)
-            # Combine current rotation with the offset
-            current_r = R_scipy.from_quat(fused_quat)
-            fused_quat = (current_r *   r_90_cw_z).as_quat()
-
-            # ONE EURO FILTER
-            # Filter Position
             fused_pos = self.pos_filter.filter(fused_pos)
+            if self.prev_cube_pose is not None and np.dot(fused_quat, self.prev_cube_pose['quat']) < 0: fused_quat = -fused_quat
+            fq_raw = self.quat_filter.filter(fused_quat)
+            fused_quat = fq_raw / np.linalg.norm(fq_raw)
 
-            # Filter Rotation (Quaternion)
-            if self.prev_cube_pose is not None:
-                # Flip sign if quaternions are in opposite hemispheres to prevent 360-degree flips
-                if np.dot(fused_quat, self.prev_cube_pose['quat']) < 0:
-                    fused_quat = -fused_quat
-            
-            # Filter the components and re-normalize to keep it a valid rotation
-            filtered_quat_raw = self.quat_filter.filter(fused_quat)
-            fused_quat = filtered_quat_raw / np.linalg.norm(filtered_quat_raw)
-
-            # Update state and broadcast
             self.prev_cube_pose = {'pos': fused_pos, 'quat': fused_quat}
             self.broadcast_frame_quat('umi_cube', fused_pos, fused_quat)
 
     def broadcast_frame_quat(self, name, pos, quat):
         t = TransformStamped()
-        t.header.stamp = self.get_clock().now().to_msg()
-        t.header.frame_id = 'camera_color_optical_frame'
-        t.child_frame_id = name
+        t.header.stamp, t.header.frame_id, t.child_frame_id = self.get_clock().now().to_msg(), 'camera_color_optical_frame', name
         t.transform.translation.x, t.transform.translation.y, t.transform.translation.z = map(float, pos)
         t.transform.rotation.x, t.transform.rotation.y, t.transform.rotation.z, t.transform.rotation.w = map(float, quat)
         self.tf_broadcaster.sendTransform(t)
